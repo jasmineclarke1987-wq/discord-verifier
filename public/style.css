@@ -1,0 +1,53 @@
+body {
+  background: #2c2f33;
+  font-family: 'Segoe UI', sans-serif;
+  color: white;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  margin: 0;
+}
+
+.container {
+  background: #23272a;
+  padding: 30px;
+  border-radius: 12px;
+  box-shadow: 0 4px 12px rgba(0,0,0,0.5);
+  text-align: center;
+  width: 400px;
+}
+
+h2 {
+  color: #7289da;
+}
+
+input[type="email"] {
+  width: 100%;
+  padding: 12px;
+  margin: 15px 0;
+  border-radius: 6px;
+  border: none;
+  outline: none;
+  font-size: 14px;
+}
+
+button {
+  background: #5865f2;
+  color: white;
+  border: none;
+  padding: 12px 20px;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 15px;
+}
+
+button:hover {
+  background: #4752c4;
+}
+
+.note {
+  margin-top: 15px;
+  font-size: 13px;
+  color: #b9bbbe;
+}
