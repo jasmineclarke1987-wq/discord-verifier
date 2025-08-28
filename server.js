@@ -47,7 +47,6 @@ function saveVerified({ discordId, username, email }) {
 async function isVPNorProxy(ip) {
   try {
     if (!ip || ip === '::1' || ip === '127.0.0.1') return false; // skip localhost
-
     const resp = await axios.get(`http://ip-api.com/json/${ip}?fields=proxy,hosting,mobile,query`);
     const d = resp.data;
     return d.proxy === true || d.hosting === true; // block VPN/datacenter
@@ -55,6 +54,53 @@ async function isVPNorProxy(ip) {
     console.error('[VPN CHECK] error:', e?.message || e);
     return false; // don’t block if API fails
   }
+}
+
+/* -----------------------------------------------------------------
+   Helper: exchange auth code for token with retries/backoff
+------------------------------------------------------------------ */
+async function exchangeCodeForToken({ code, clientId, clientSecret, redirectUri, fetchImpl }) {
+  const fetchFn = fetchImpl || fetch;
+  const form = () => new URLSearchParams({
+    client_id: clientId,
+    client_secret: clientSecret,
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: redirectUri,
+  });
+
+  const maxAttempts = 3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const resp = await fetchFn('https://discord.com/api/oauth2/token', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        // UA helps some Cloudflare edges identify the client cleanly
+        'User-Agent': 'rp-verifier/1.0 (+https://discord.com) node-fetch',
+      },
+      body: form(),
+    });
+
+    if (resp.ok) {
+      return await resp.json();
+    }
+
+    // On 429, back off and retry
+    if (resp.status === 429 && attempt < maxAttempts) {
+      const ra = Number(resp.headers.get('retry-after')) || 2;
+      console.warn(`[CALLBACK] 429 token exchange. Retrying in ${ra}s (attempt ${attempt}/${maxAttempts})`);
+      await new Promise(r => setTimeout(r, ra * 1000));
+      continue;
+    }
+
+    // Any other error: capture details and throw
+    const txt = await resp.text().catch(() => '');
+    const err = new Error(`token exchange failed: ${resp.status} ${txt}`);
+    err.status = resp.status;
+    throw err;
+  }
+
+  throw new Error('token exchange failed after retries.');
 }
 
 /* -----------------------------------
@@ -77,29 +123,40 @@ app.get('/callback', async (req, res) => {
     const code = req.query.code;
     if (!code) return res.status(400).send('No code. Start again: <a href="/login">/login</a>');
 
-    const tokenResp = await fetch('https://discord.com/api/oauth2/token', {
-      method: 'POST',
-      headers: { 'Content-Type':'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({
-        client_id: CLIENT_ID,
-        client_secret: CLIENT_SECRET,
-        grant_type: 'authorization_code',
+    // ✅ robust token exchange with retry/backoff
+    let access_token;
+    try {
+      const tok = await exchangeCodeForToken({
         code,
-        redirect_uri: REDIRECT_URI
-      })
-    });
-    if (!tokenResp.ok) {
-      const t = await tokenResp.text().catch(() => '');
-      console.error('[CALLBACK] token exchange failed:', tokenResp.status, t);
-      return res.status(400).send('OAuth failed. Try again via <a href="/login">/login</a>.');
+        clientId: CLIENT_ID,
+        clientSecret: CLIENT_SECRET,
+        redirectUri: REDIRECT_URI,
+        fetchImpl: fetch,
+      });
+      access_token = tok.access_token;
+    } catch (err) {
+      console.error('[CALLBACK]', err?.message || err);
+      const msg = String(err?.message || '');
+      if (msg.includes('429')) {
+        return res
+          .status(429)
+          .send('We are being rate-limited by Discord. Please wait ~60 seconds and try again via <a href="/login">/login</a>.');
+      }
+      return res
+        .status(400)
+        .send('OAuth failed. Please try again via <a href="/login">/login</a>.');
     }
 
-    const { access_token } = await tokenResp.json();
-    if (!access_token) return res.status(400).send('No access_token. Try <a href="/login">/login</a> again.');
+    if (!access_token) {
+      return res.status(400).send('No access_token. Try <a href="/login">/login</a> again.');
+    }
 
     // Fetch user
     const meResp = await fetch('https://discord.com/api/users/@me', {
-      headers: { Authorization: `Bearer ${access_token}` }
+      headers: {
+        Authorization: `Bearer ${access_token}`,
+        'User-Agent': 'rp-verifier/1.0 (+https://discord.com) node-fetch',
+      }
     });
     if (!meResp.ok) {
       const t = await meResp.text().catch(() => '');
@@ -168,7 +225,8 @@ app.post('/verify', async (req, res) => {
         method: 'PUT',
         headers: {
           'Authorization': `Bot ${BOT_TOKEN}`,
-          'Content-Type': 'application/json'
+          'Content-Type': 'application/json',
+          'User-Agent': 'rp-verifier/1.0 (+https://discord.com) node-fetch',
         },
         body: JSON.stringify({ access_token: userAccessToken })
       });
