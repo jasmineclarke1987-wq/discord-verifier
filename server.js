@@ -104,6 +104,14 @@ async function exchangeCodeForToken({ code, clientId, clientSecret, redirectUri,
 }
 
 /* -----------------------------------
+   /health → simple warm-up/monitor
+----------------------------------- */
+app.get('/health', (_req, res) => {
+  res.set('Cache-Control', 'no-store');
+  res.status(200).send('ok');
+});
+
+/* -----------------------------------
    /login → send user to authorize
 ----------------------------------- */
 app.get('/login', (req, res) => {
