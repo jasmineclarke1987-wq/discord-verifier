@@ -7,7 +7,9 @@ const fetch = require('node-fetch');            // if Node < 18, installed as no
 const client = require('./bot');
 const fs = require('fs');
 const path = require('path');
-const axios = require('axios');                 // ✅ added axios
+const axios = require('axios');
+const crypto = require('crypto');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 
@@ -19,19 +21,23 @@ app.set('trust proxy', true);
 // ✅ Serve static files (style.css in /public folder)
 app.use(express.static('public'));
 
+// ✅ Rate-limit /verify to avoid abuse
+app.use('/verify', rateLimit({ windowMs: 2 * 60 * 1000, max: 20 }));
+
 const {
   CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, TOKEN: BOT_TOKEN,
   MAIN_GUILD_ID, BACKUP_GUILD_ID,
   VERIFIED_ROLE_ID_MAIN, VERIFIED_ROLE_ID_BACKUP,
-  LOG_CHANNEL_ID, BACKUP_INVITE_URL
+  LOG_CHANNEL_ID, BACKUP_INVITE_URL,
+  ADMIN_USER, ADMIN_PASS
 } = process.env;
 
-// ✅ Data storage setup
-const DATA_DIR = path.join(__dirname, 'data');
+// ✅ Data storage setup (supports Render disk via DATA_DIR)
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const VERIFIED_JSON = path.join(DATA_DIR, 'verified.json');
 
 function ensureStore() {
-  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR);
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(VERIFIED_JSON)) fs.writeFileSync(VERIFIED_JSON, '[]', 'utf8');
 }
 
@@ -42,6 +48,34 @@ function saveVerified({ discordId, username, email }) {
   arr.push({ discordId, username, email, verifiedAt: now });
   fs.writeFileSync(VERIFIED_JSON, JSON.stringify(arr, null, 2), 'utf8');
 }
+
+// ✅ Basic auth for admin CSV route
+function requireAuth(req, res, next) {
+  if (!ADMIN_USER || !ADMIN_PASS) return res.status(403).send('Admin auth not configured.');
+  const hdr = req.headers.authorization || '';
+  const b64 = hdr.startsWith('Basic ') ? hdr.slice(6) : '';
+  const [u, p] = Buffer.from(b64 || ':', 'base64').toString().split(':');
+  if (u === ADMIN_USER && p === ADMIN_PASS) return next();
+  res.set('WWW-Authenticate', 'Basic realm="admin"');
+  res.status(401).send('Auth required');
+}
+
+// ✅ Disposable / fake email domains (starter list)
+const DISPOSABLE_DOMAINS = new Set([
+  'mailinator.com', 'yopmail.com', 'guerrillamail.com', '10minutemail.com',
+  'tempmail.email', 'tempmailo.com', 'trashmail.com', 'fakemail.net',
+  'getnada.com', 'sharklasers.com', 'moakt.com', 'maildrop.cc', 'mailpoof.com'
+]);
+function looksDisposable(email = '') {
+  const at = email.lastIndexOf('@');
+  if (at < 0) return true;
+  const domain = email.slice(at + 1).toLowerCase().trim();
+  return DISPOSABLE_DOMAINS.has(domain);
+}
+
+// ✅ Cookie options (secure in production)
+const cookieSecure = process.env.NODE_ENV === 'production';
+const cookieOpts = { httpOnly: true, sameSite: 'lax', secure: cookieSecure };
 
 // ✅ VPN / proxy detector using ip-api.com
 async function isVPNorProxy(ip) {
@@ -112,14 +146,19 @@ app.get('/health', (_req, res) => {
 });
 
 /* -----------------------------------
-   /login → send user to authorize
+   /login → send user to authorize (with state)
 ----------------------------------- */
 app.get('/login', (req, res) => {
+  const state = crypto.randomBytes(16).toString('hex');
+  res.cookie('oauth_state', state, { ...cookieOpts, maxAge: 10 * 60 * 1000 });
+
   const url = 'https://discord.com/api/oauth2/authorize'
     + `?client_id=${encodeURIComponent(CLIENT_ID)}`
     + `&redirect_uri=${encodeURIComponent(REDIRECT_URI)}`
     + `&response_type=code`
-    + `&scope=${encodeURIComponent('identify guilds.join')}`;
+    + `&scope=${encodeURIComponent('identify guilds.join')}`
+    + `&state=${state}`
+    + `&prompt=consent`;
   res.redirect(url);
 });
 
@@ -130,6 +169,11 @@ app.get('/callback', async (req, res) => {
   try {
     const code = req.query.code;
     if (!code) return res.status(400).send('No code. Start again: <a href="/login">/login</a>');
+
+    // ✅ verify OAuth state (prevents stale/mismatched callbacks)
+    if (!req.query.state || req.query.state !== req.cookies.oauth_state) {
+      return res.status(400).send('OAuth state mismatch. Please start again at <a href="/login">/login</a>.');
+    }
 
     // ✅ robust token exchange with retry/backoff
     let access_token;
@@ -173,8 +217,8 @@ app.get('/callback', async (req, res) => {
     }
     const me = await meResp.json();
 
-    res.cookie('discordId', me.id, { httpOnly: true });
-    res.cookie('userAccessToken', access_token, { httpOnly: true });
+    res.cookie('discordId', me.id, cookieOpts);
+    res.cookie('userAccessToken', access_token, cookieOpts);
 
     return res.send(`
       <html>
@@ -191,7 +235,13 @@ app.get('/callback', async (req, res) => {
               <input type="email" name="email" placeholder="Enter your email" required>
               <button type="submit">Verify</button>
             </form>
-            <p class="note">⚠️ Use only home Wi-Fi or mobile data. VPNs / public Wi-Fi are not allowed.</p>
+
+            <p class="note note--important">
+              ⚠️ <b>Use only home Wi-Fi or mobile data. VPNs / public Wi-Fi are not allowed.</b>
+            </p>
+            <p class="note note--important">
+              🚨 <b>Automated, disposable, or fake emails will result in a ban.</b>
+            </p>
           </div>
         </body>
       </html>
@@ -213,6 +263,11 @@ app.post('/verify', async (req, res) => {
 
     if (!email) return res.status(400).send('Please provide an email.');
     if (!discordId || !userAccessToken) return res.status(400).send('Session expired. Go to <a href="/login">/login</a>.');
+
+    // ✅ Reject disposable/fake emails
+    if (looksDisposable(email)) {
+      return res.status(400).send("❌ Invalid email: disposable or automated addresses are not allowed.");
+    }
 
     // ✅ VPN / Proxy check
     let ip = req.ip;
@@ -303,9 +358,9 @@ app.post('/verify', async (req, res) => {
 });
 
 /* -----------------------------------------------------------------
-   Admin route: download CSV of verified users
+   Admin route: download CSV of verified users (now protected)
 ------------------------------------------------------------------ */
-app.get('/admin/verified.csv', (req, res) => {
+app.get('/admin/verified.csv', requireAuth, (req, res) => {
   try {
     ensureStore();
     const rows = JSON.parse(fs.readFileSync(VERIFIED_JSON, 'utf8'));

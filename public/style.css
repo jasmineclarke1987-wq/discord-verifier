@@ -51,3 +51,10 @@ button:hover {
   font-size: 13px;
   color: #b9bbbe;
 }
+
+/* very important notices */
+.note--important {
+  font-weight: 700;
+  color: #ff5252;          /* high-visibility red */
+  display: block;
+}
