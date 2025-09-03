@@ -11,7 +11,7 @@ const axios = require('axios');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 
-// NEW: stronger disposable-email detection deps
+// NEW: stronger disposable-email detection deps (already installed in your project)
 const dns = require('dns').promises;
 const { parse } = require('tldts');
 const disposableList = require('disposable-email-domains');
@@ -68,17 +68,45 @@ function requireAuth(req, res, next) {
 /* -------------------------------
    Strong disposable/invalid email
 -------------------------------- */
-// Huge maintained list (lowercased)
+// Base list (lowercased)
 const DISPOSABLE_SET = new Set(disposableList.map(d => d.toLowerCase()));
 
-// Optional extra blocks via env: "tempmail.email,temp-mail.org"
+// Extra domains via env (comma-separated), e.g. "tempmail.email,noidem.com"
 const EXTRA_DISPOSABLE = (process.env.EXTRA_DISPOSABLE_DOMAINS || '')
   .split(',')
   .map(s => s.trim().toLowerCase())
   .filter(Boolean);
 for (const d of EXTRA_DISPOSABLE) DISPOSABLE_SET.add(d);
 
-// Parse to get host + registrable root (e.g., sub.x.y → x.y)
+// MX host pattern blocks (known disposable providers)
+const MX_BLOCK_PATTERNS = [
+  /(^|\.)1secmail\.(org|com|net)$/i,
+  /(^|\.)tempmail\.(email|io|dev|plus)$/i,
+  /(^|\.)temp-mail\.(org|io)$/i,
+  /(^|\.)guerrillamail\.com$/i,
+  /(^|\.)yopmail\.com$/i,
+  /(^|\.)mailinator\.com$/i,
+  /(^|\.)trashmail\.(com|io)$/i,
+  /(^|\.)getnada\.com$/i,
+  /(^|\.)sharklasers\.com$/i,
+  /(^|\.)moakt\.com$/i,
+  /(^|\.)mohmal\.com$/i,
+  /(^|\.)dropmail\.(me|me\.u?a?)$/i,
+  /(^|\.)mintemail\.com$/i,
+  /(^|\.)dispostable\.com$/i
+];
+
+// Allow adding new MX host patterns quickly via env (pipe-separated regexes)
+// Example value:  '(^|\\.)noidem\\.com$|(^|\\.)mx-noidem\\.com$'
+const EXTRA_MX_BLOCK = (process.env.EXTRA_DISPOSABLE_MX || '')
+  .split('|')
+  .map(s => s.trim())
+  .filter(Boolean);
+for (const pat of EXTRA_MX_BLOCK) {
+  try { MX_BLOCK_PATTERNS.push(new RegExp(pat, 'i')); } catch {}
+}
+
+// Helper: get domain host + registrable root (sub.a.b.c -> b.c)
 function getDomains(email = '') {
   const at = email.lastIndexOf('@');
   if (at < 0) return {};
@@ -88,21 +116,31 @@ function getDomains(email = '') {
 }
 
 async function isDisposableOrInvalidEmail(email = '') {
-  // Basic shape
+  // Basic shape: simple sanity
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return true;
 
   const { host, root } = getDomains(email);
   if (!host || !root) return true;
 
-  // Block if domain or root is on disposable list
+  // Direct domain/root block
   if (DISPOSABLE_SET.has(host) || DISPOSABLE_SET.has(root)) return true;
 
-  // DNS MX check: if no MX, treat as invalid
+  // DNS MX check: no MX = invalid
+  let mx;
   try {
-    const mx = await dns.resolveMx(host);
+    mx = await dns.resolveMx(host);
     if (!mx || mx.length === 0) return true;
   } catch {
     return true; // DNS lookup failed -> invalid
+  }
+
+  // MX hostname pattern block (provider-based)
+  const mxHosts = mx.map(r => (r && r.exchange ? String(r.exchange).toLowerCase() : ''));
+  for (const h of mxHosts) {
+    if (!h) continue;
+    if (MX_BLOCK_PATTERNS.some(rx => rx.test(h))) {
+      return true;
+    }
   }
 
   return false; // looks good
