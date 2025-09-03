@@ -19,6 +19,7 @@
     "express": "^5.1.0",
     "express-rate-limit": "^8.0.1",
     "node-fetch": "^2.7.0",
+    "nodemailer": "^7.0.6",
     "tldts": "^7.0.12"
   },
   "engines": {
