@@ -212,6 +212,55 @@ async function exchangeCodeForToken({ code, clientId, clientSecret, redirectUri,
 }
 
 /* -----------------------------------
+   LOGGING HELPERS (fixes your missing log)
+----------------------------------- */
+async function getLogChannel() {
+  const id = process.env.LOG_CHANNEL_ID;
+  if (!id) throw new Error('LOG_CHANNEL_ID not set');
+  try {
+    const ch = await client.channels.fetch(id);
+    if (!ch) throw new Error('Channel fetch returned null');
+    return ch;
+  } catch (e) {
+    console.error('[LOG] fetch failed:', e?.message || e);
+    throw e;
+  }
+}
+
+async function sendVerificationLog({ discordId, email }) {
+  try {
+    const ch = await getLogChannel();
+
+    // Try embed first
+    const payload = {
+      embeds: [{
+        title: '✅ New verification',
+        color: 0x57F287,
+        fields: [
+          { name: 'User', value: `<@${discordId}> (${discordId})`, inline: false },
+          { name: 'Email', value: email || '—', inline: true }
+        ],
+        timestamp: new Date()
+      }]
+    };
+
+    const msg = await ch.send(payload).catch(err => {
+      console.error('[LOG] embed send failed:', err?.message || err);
+      return null;
+    });
+
+    // Plain-text fallback if embeds aren’t allowed
+    if (!msg) {
+      await ch.send(`✅ New verification: <@${discordId}> (${discordId}) | ${email || '—'}`).catch(err => {
+        console.error('[LOG] plaintext send failed:', err?.message || err);
+      });
+    }
+  } catch (e) {
+    console.error('[LOG] sendVerificationLog error:', e?.message || e);
+  }
+}
+
+/* -----------------------------------
    /health → simple warm-up/monitor
 ----------------------------------- */
 app.get('/health', (_req, res) => {
@@ -395,25 +444,8 @@ app.post('/verify', async (req, res) => {
       }
     }
 
-    // E) Log verification to staff channel
-    if (LOG_CHANNEL_ID) {
-      try {
-        const logCh = await client.channels.fetch(LOG_CHANNEL_ID);
-        await logCh.send({
-          embeds: [{
-            title: '✅ User Verified',
-            color: 0x57F287,
-            fields: [
-              { name: 'User', value: `<@${discordId}> (${discordId})` },
-              { name: 'Email', value: email }
-            ],
-            timestamp: new Date()
-          }]
-        });
-      } catch (e) {
-        console.error('[VERIFY] Failed to send log:', e);
-      }
-    }
+    // E) Log verification to staff channel  🔔 (new helper)
+    await sendVerificationLog({ discordId, email });
 
     // F) Save to verified.json
     try {
@@ -450,6 +482,18 @@ app.get('/admin/verified.csv', requireAuth, (req, res) => {
   } catch (e) {
     console.error('[ADMIN] export csv error:', e);
     res.status(500).send('Could not generate CSV');
+  }
+});
+
+/* -----------------------------------
+   Test route to verify logging works
+----------------------------------- */
+app.get('/_testlog', requireAuth, async (req, res) => {
+  try {
+    await sendVerificationLog({ discordId: '000000000000000000', email: 'test@example.com' });
+    res.status(200).send('Sent test log to LOG_CHANNEL_ID.');
+  } catch (e) {
+    res.status(500).send('Failed to send test log. Check server logs.');
   }
 });
 
