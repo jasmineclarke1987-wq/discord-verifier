@@ -11,6 +11,11 @@ const axios = require('axios');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
 
+// NEW: stronger disposable-email detection deps
+const dns = require('dns').promises;
+const { parse } = require('tldts');
+const disposableList = require('disposable-email-domains');
+
 const app = express();
 
 app.use(express.urlencoded({ extended: true }));
@@ -60,24 +65,58 @@ function requireAuth(req, res, next) {
   res.status(401).send('Auth required');
 }
 
-// ✅ Disposable / fake email domains (starter list)
-const DISPOSABLE_DOMAINS = new Set([
-  'mailinator.com', 'yopmail.com', 'guerrillamail.com', '10minutemail.com',
-  'tempmail.email', 'tempmailo.com', 'trashmail.com', 'fakemail.net',
-  'getnada.com', 'sharklasers.com', 'moakt.com', 'maildrop.cc', 'mailpoof.com'
-]);
-function looksDisposable(email = '') {
+/* -------------------------------
+   Strong disposable/invalid email
+-------------------------------- */
+// Huge maintained list (lowercased)
+const DISPOSABLE_SET = new Set(disposableList.map(d => d.toLowerCase()));
+
+// Optional extra blocks via env: "tempmail.email,temp-mail.org"
+const EXTRA_DISPOSABLE = (process.env.EXTRA_DISPOSABLE_DOMAINS || '')
+  .split(',')
+  .map(s => s.trim().toLowerCase())
+  .filter(Boolean);
+for (const d of EXTRA_DISPOSABLE) DISPOSABLE_SET.add(d);
+
+// Parse to get host + registrable root (e.g., sub.x.y → x.y)
+function getDomains(email = '') {
   const at = email.lastIndexOf('@');
-  if (at < 0) return true;
-  const domain = email.slice(at + 1).toLowerCase().trim();
-  return DISPOSABLE_DOMAINS.has(domain);
+  if (at < 0) return {};
+  const host = email.slice(at + 1).toLowerCase().trim();
+  const info = parse(host); // { domain, hostname, ... }
+  return { host, root: info.domain || host };
 }
 
-// ✅ Cookie options (secure in production)
+async function isDisposableOrInvalidEmail(email = '') {
+  // Basic shape
+  if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return true;
+
+  const { host, root } = getDomains(email);
+  if (!host || !root) return true;
+
+  // Block if domain or root is on disposable list
+  if (DISPOSABLE_SET.has(host) || DISPOSABLE_SET.has(root)) return true;
+
+  // DNS MX check: if no MX, treat as invalid
+  try {
+    const mx = await dns.resolveMx(host);
+    if (!mx || mx.length === 0) return true;
+  } catch {
+    return true; // DNS lookup failed -> invalid
+  }
+
+  return false; // looks good
+}
+
+/* -------------------------------
+   Cookie options (secure in prod)
+-------------------------------- */
 const cookieSecure = process.env.NODE_ENV === 'production';
 const cookieOpts = { httpOnly: true, sameSite: 'lax', secure: cookieSecure };
 
-// ✅ VPN / proxy detector using ip-api.com
+/* --------------------------------------
+   VPN / proxy detector using ip-api.com
+--------------------------------------- */
 async function isVPNorProxy(ip) {
   try {
     if (!ip || ip === '::1' || ip === '127.0.0.1') return false; // skip localhost
@@ -109,7 +148,6 @@ async function exchangeCodeForToken({ code, clientId, clientSecret, redirectUri,
       method: 'POST',
       headers: {
         'Content-Type': 'application/x-www-form-urlencoded',
-        // UA helps some Cloudflare edges identify the client cleanly
         'User-Agent': 'rp-verifier/1.0 (+https://discord.com) node-fetch',
       },
       body: form(),
@@ -119,7 +157,6 @@ async function exchangeCodeForToken({ code, clientId, clientSecret, redirectUri,
       return await resp.json();
     }
 
-    // On 429, back off and retry
     if (resp.status === 429 && attempt < maxAttempts) {
       const ra = Number(resp.headers.get('retry-after')) || 2;
       console.warn(`[CALLBACK] 429 token exchange. Retrying in ${ra}s (attempt ${attempt}/${maxAttempts})`);
@@ -127,7 +164,6 @@ async function exchangeCodeForToken({ code, clientId, clientSecret, redirectUri,
       continue;
     }
 
-    // Any other error: capture details and throw
     const txt = await resp.text().catch(() => '');
     const err = new Error(`token exchange failed: ${resp.status} ${txt}`);
     err.status = resp.status;
@@ -170,12 +206,12 @@ app.get('/callback', async (req, res) => {
     const code = req.query.code;
     if (!code) return res.status(400).send('No code. Start again: <a href="/login">/login</a>');
 
-    // ✅ verify OAuth state (prevents stale/mismatched callbacks)
+    // verify OAuth state
     if (!req.query.state || req.query.state !== req.cookies.oauth_state) {
       return res.status(400).send('OAuth state mismatch. Please start again at <a href="/login">/login</a>.');
     }
 
-    // ✅ robust token exchange with retry/backoff
+    // token exchange with retry/backoff
     let access_token;
     try {
       const tok = await exchangeCodeForToken({
@@ -264,9 +300,9 @@ app.post('/verify', async (req, res) => {
     if (!email) return res.status(400).send('Please provide an email.');
     if (!discordId || !userAccessToken) return res.status(400).send('Session expired. Go to <a href="/login">/login</a>.');
 
-    // ✅ Reject disposable/fake emails
-    if (looksDisposable(email)) {
-      return res.status(400).send("❌ Invalid email: disposable or automated addresses are not allowed.");
+    // ✅ Strong disposable/invalid email check
+    if (await isDisposableOrInvalidEmail(email)) {
+      return res.status(400).send('❌ Invalid email: disposable, automated, or non-receiving addresses are not allowed.');
     }
 
     // ✅ VPN / Proxy check
@@ -281,7 +317,7 @@ app.post('/verify', async (req, res) => {
       );
     }
 
-    // A) Auto-join BACKUP server
+    // A) Auto-join BACKUP server (best-effort)
     let joinedBackup = false;
     if (BACKUP_GUILD_ID) {
       const joinResp = await fetch(`https://discord.com/api/guilds/${BACKUP_GUILD_ID}/members/${discordId}`, {
