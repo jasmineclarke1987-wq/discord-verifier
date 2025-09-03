@@ -10,6 +10,7 @@ const path = require('path');
 const axios = require('axios');
 const crypto = require('crypto');
 const rateLimit = require('express-rate-limit');
+const nodemailer = require('nodemailer');
 
 // NEW: stronger disposable-email detection deps (already installed in your project)
 const dns = require('dns').promises;
@@ -26,32 +27,37 @@ app.set('trust proxy', true);
 // ✅ Serve static files (style.css in /public folder)
 app.use(express.static('public'));
 
-// ✅ Rate-limit /verify to avoid abuse
-app.use('/verify', rateLimit({ windowMs: 2 * 60 * 1000, max: 20 }));
+// ✅ Rate-limits
+app.use('/verify', rateLimit({ windowMs: 2 * 60 * 1000, max: 20 }));          // email submit
+app.use('/verify/confirm', rateLimit({ windowMs: 2 * 60 * 1000, max: 20 }));  // code submit
+app.use('/verify/resend', rateLimit({ windowMs: 5 * 60 * 1000, max: 5 }));    // resend
 
 const {
   CLIENT_ID, CLIENT_SECRET, REDIRECT_URI, TOKEN: BOT_TOKEN,
   MAIN_GUILD_ID, BACKUP_GUILD_ID,
   VERIFIED_ROLE_ID_MAIN, VERIFIED_ROLE_ID_BACKUP,
   LOG_CHANNEL_ID, BACKUP_INVITE_URL,
-  ADMIN_USER, ADMIN_PASS
+  ADMIN_USER, ADMIN_PASS,
+  SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM
 } = process.env;
 
 // ✅ Data storage setup (supports Render disk via DATA_DIR)
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const VERIFIED_JSON = path.join(DATA_DIR, 'verified.json');
+const PENDING_JSON = path.join(DATA_DIR, 'pending.json'); // NEW: pending OTPs
 
 function ensureStore() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   if (!fs.existsSync(VERIFIED_JSON)) fs.writeFileSync(VERIFIED_JSON, '[]', 'utf8');
+  if (!fs.existsSync(PENDING_JSON)) fs.writeFileSync(PENDING_JSON, '[]', 'utf8');
 }
+function readJson(file) { ensureStore(); return JSON.parse(fs.readFileSync(file, 'utf8')); }
+function writeJson(file, data) { ensureStore(); fs.writeFileSync(file, JSON.stringify(data, null, 2), 'utf8'); }
 
 function saveVerified({ discordId, username, email }) {
-  ensureStore();
-  const now = new Date().toISOString();
-  const arr = JSON.parse(fs.readFileSync(VERIFIED_JSON, 'utf8'));
-  arr.push({ discordId, username, email, verifiedAt: now });
-  fs.writeFileSync(VERIFIED_JSON, JSON.stringify(arr, null, 2), 'utf8');
+  const arr = readJson(VERIFIED_JSON);
+  arr.push({ discordId, username, email, verifiedAt: new Date().toISOString() });
+  writeJson(VERIFIED_JSON, arr);
 }
 
 // ✅ Basic auth for admin CSV route
@@ -68,17 +74,11 @@ function requireAuth(req, res, next) {
 /* -------------------------------
    Strong disposable/invalid email
 -------------------------------- */
-// Base list (lowercased)
 const DISPOSABLE_SET = new Set(disposableList.map(d => d.toLowerCase()));
-
-// Extra domains via env (comma-separated), e.g. "tempmail.email,noidem.com"
 const EXTRA_DISPOSABLE = (process.env.EXTRA_DISPOSABLE_DOMAINS || '')
-  .split(',')
-  .map(s => s.trim().toLowerCase())
-  .filter(Boolean);
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
 for (const d of EXTRA_DISPOSABLE) DISPOSABLE_SET.add(d);
 
-// MX host pattern blocks (known disposable providers)
 const MX_BLOCK_PATTERNS = [
   /(^|\.)1secmail\.(org|com|net)$/i,
   /(^|\.)tempmail\.(email|io|dev|plus)$/i,
@@ -95,55 +95,34 @@ const MX_BLOCK_PATTERNS = [
   /(^|\.)mintemail\.com$/i,
   /(^|\.)dispostable\.com$/i
 ];
-
-// Allow adding new MX host patterns quickly via env (pipe-separated regexes)
-// Example value:  '(^|\\.)noidem\\.com$|(^|\\.)mx-noidem\\.com$'
 const EXTRA_MX_BLOCK = (process.env.EXTRA_DISPOSABLE_MX || '')
-  .split('|')
-  .map(s => s.trim())
-  .filter(Boolean);
-for (const pat of EXTRA_MX_BLOCK) {
-  try { MX_BLOCK_PATTERNS.push(new RegExp(pat, 'i')); } catch {}
-}
+  .split('|').map(s => s.trim()).filter(Boolean);
+for (const pat of EXTRA_MX_BLOCK) { try { MX_BLOCK_PATTERNS.push(new RegExp(pat, 'i')); } catch {} }
 
-// Helper: get domain host + registrable root (sub.a.b.c -> b.c)
 function getDomains(email = '') {
   const at = email.lastIndexOf('@');
   if (at < 0) return {};
   const host = email.slice(at + 1).toLowerCase().trim();
-  const info = parse(host); // { domain, hostname, ... }
+  const info = parse(host);
   return { host, root: info.domain || host };
 }
 
 async function isDisposableOrInvalidEmail(email = '') {
-  // Basic shape: simple sanity
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) return true;
-
   const { host, root } = getDomains(email);
   if (!host || !root) return true;
-
-  // Direct domain/root block
   if (DISPOSABLE_SET.has(host) || DISPOSABLE_SET.has(root)) return true;
 
-  // DNS MX check: no MX = invalid
   let mx;
   try {
     mx = await dns.resolveMx(host);
     if (!mx || mx.length === 0) return true;
-  } catch {
-    return true; // DNS lookup failed -> invalid
-  }
+  } catch { return true; }
 
-  // MX hostname pattern block (provider-based)
   const mxHosts = mx.map(r => (r && r.exchange ? String(r.exchange).toLowerCase() : ''));
-  for (const h of mxHosts) {
-    if (!h) continue;
-    if (MX_BLOCK_PATTERNS.some(rx => rx.test(h))) {
-      return true;
-    }
-  }
+  for (const h of mxHosts) if (MX_BLOCK_PATTERNS.some(rx => rx.test(h))) return true;
 
-  return false; // looks good
+  return false;
 }
 
 /* -------------------------------
@@ -157,13 +136,13 @@ const cookieOpts = { httpOnly: true, sameSite: 'lax', secure: cookieSecure };
 --------------------------------------- */
 async function isVPNorProxy(ip) {
   try {
-    if (!ip || ip === '::1' || ip === '127.0.0.1') return false; // skip localhost
+    if (!ip || ip === '::1' || ip === '127.0.0.1') return false;
     const resp = await axios.get(`http://ip-api.com/json/${ip}?fields=proxy,hosting,mobile,query`);
     const d = resp.data;
-    return d.proxy === true || d.hosting === true; // block VPN/datacenter
+    return d.proxy === true || d.hosting === true;
   } catch (e) {
     console.error('[VPN CHECK] error:', e?.message || e);
-    return false; // don’t block if API fails
+    return false;
   }
 }
 
@@ -173,46 +152,32 @@ async function isVPNorProxy(ip) {
 async function exchangeCodeForToken({ code, clientId, clientSecret, redirectUri, fetchImpl }) {
   const fetchFn = fetchImpl || fetch;
   const form = () => new URLSearchParams({
-    client_id: clientId,
-    client_secret: clientSecret,
-    grant_type: 'authorization_code',
-    code,
-    redirect_uri: redirectUri,
+    client_id: clientId, client_secret: clientSecret,
+    grant_type: 'authorization_code', code, redirect_uri: redirectUri,
   });
 
   const maxAttempts = 3;
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
     const resp = await fetchFn('https://discord.com/api/oauth2/token', {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-        'User-Agent': 'rp-verifier/1.0 (+https://discord.com) node-fetch',
-      },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': 'rp-verifier/1.0 node-fetch' },
       body: form(),
     });
-
-    if (resp.ok) {
-      return await resp.json();
-    }
-
+    if (resp.ok) return await resp.json();
     if (resp.status === 429 && attempt < maxAttempts) {
       const ra = Number(resp.headers.get('retry-after')) || 2;
       console.warn(`[CALLBACK] 429 token exchange. Retrying in ${ra}s (attempt ${attempt}/${maxAttempts})`);
       await new Promise(r => setTimeout(r, ra * 1000));
       continue;
     }
-
     const txt = await resp.text().catch(() => '');
-    const err = new Error(`token exchange failed: ${resp.status} ${txt}`);
-    err.status = resp.status;
-    throw err;
+    throw new Error(`token exchange failed: ${resp.status} ${txt}`);
   }
-
   throw new Error('token exchange failed after retries.');
 }
 
 /* -----------------------------------
-   LOGGING HELPERS (fixes your missing log)
+   LOGGING HELPERS
 ----------------------------------- */
 async function getLogChannel() {
   const id = process.env.LOG_CHANNEL_ID;
@@ -230,8 +195,6 @@ async function getLogChannel() {
 async function sendVerificationLog({ discordId, email }) {
   try {
     const ch = await getLogChannel();
-
-    // Try embed first
     const payload = {
       embeds: [{
         title: '✅ New verification',
@@ -243,21 +206,42 @@ async function sendVerificationLog({ discordId, email }) {
         timestamp: new Date()
       }]
     };
-
-    const msg = await ch.send(payload).catch(err => {
-      console.error('[LOG] embed send failed:', err?.message || err);
-      return null;
-    });
-
-    // Plain-text fallback if embeds aren’t allowed
-    if (!msg) {
-      await ch.send(`✅ New verification: <@${discordId}> (${discordId}) | ${email || '—'}`).catch(err => {
-        console.error('[LOG] plaintext send failed:', err?.message || err);
-      });
-    }
+    const msg = await ch.send(payload).catch(err => { console.error('[LOG] embed send failed:', err?.message || err); return null; });
+    if (!msg) await ch.send(`✅ New verification: <@${discordId}> (${discordId}) | ${email || '—'}`).catch(err => console.error('[LOG] plaintext send failed:', err?.message || err));
   } catch (e) {
     console.error('[LOG] sendVerificationLog error:', e?.message || e);
   }
+}
+
+/* -----------------------------------
+   EMAIL (SMTP) — send 6-digit OTP
+----------------------------------- */
+function makeTransport() {
+  if (!SMTP_HOST || !SMTP_PORT || !SMTP_USER || !SMTP_PASS || !SMTP_FROM) {
+    console.warn('[SMTP] Missing env (SMTP_HOST/PORT/USER/PASS/FROM). Emails will fail.');
+  }
+  return nodemailer.createTransport({
+    host: SMTP_HOST,
+    port: Number(SMTP_PORT || 587),
+    secure: false, // STARTTLS
+    auth: { user: SMTP_USER, pass: SMTP_PASS }
+  });
+}
+const mailer = makeTransport();
+
+function generateCode() {
+  // 6-digit numeric, zero-padded
+  return (Math.floor(Math.random() * 1_000_000)).toString().padStart(6, '0');
+}
+async function sendOtpEmail(to, code) {
+  const html = `
+    <div style="font-family:Segoe UI,Arial,sans-serif;font-size:16px">
+      <p>Here is your verification code:</p>
+      <p style="font-size:24px;font-weight:700;letter-spacing:3px">${code}</p>
+      <p>This code expires in <b>10 minutes</b>. If you didn’t request it, you can ignore this email.</p>
+    </div>`;
+  const text = `Your verification code is: ${code}\nIt expires in 10 minutes.`;
+  await mailer.sendMail({ from: SMTP_FROM, to, subject: 'Your verification code', text, html });
 }
 
 /* -----------------------------------
@@ -292,82 +276,41 @@ app.get('/callback', async (req, res) => {
   try {
     const code = req.query.code;
     if (!code) return res.status(400).send('No code. Start again: <a href="/login">/login</a>');
-
-    // verify OAuth state
     if (!req.query.state || req.query.state !== req.cookies.oauth_state) {
       return res.status(400).send('OAuth state mismatch. Please start again at <a href="/login">/login</a>.');
     }
 
-    // token exchange with retry/backoff
     let access_token;
     try {
-      const tok = await exchangeCodeForToken({
-        code,
-        clientId: CLIENT_ID,
-        clientSecret: CLIENT_SECRET,
-        redirectUri: REDIRECT_URI,
-        fetchImpl: fetch,
-      });
+      const tok = await exchangeCodeForToken({ code, clientId: CLIENT_ID, clientSecret: CLIENT_SECRET, redirectUri: REDIRECT_URI, fetchImpl: fetch });
       access_token = tok.access_token;
     } catch (err) {
-      console.error('[CALLBACK]', err?.message || err);
       const msg = String(err?.message || '');
-      if (msg.includes('429')) {
-        return res
-          .status(429)
-          .send('We are being rate-limited by Discord. Please wait ~60 seconds and try again via <a href="/login">/login</a>.');
-      }
-      return res
-        .status(400)
-        .send('OAuth failed. Please try again via <a href="/login">/login</a>.');
+      if (msg.includes('429')) return res.status(429).send('Rate-limited by Discord. Wait ~60s and try <a href="/login">/login</a>.');
+      return res.status(400).send('OAuth failed. Try <a href="/login">/login</a>.');
     }
+    if (!access_token) return res.status(400).send('No access_token. Try <a href="/login">/login</a>.');
 
-    if (!access_token) {
-      return res.status(400).send('No access_token. Try <a href="/login">/login</a> again.');
-    }
-
-    // Fetch user
-    const meResp = await fetch('https://discord.com/api/users/@me', {
-      headers: {
-        Authorization: `Bearer ${access_token}`,
-        'User-Agent': 'rp-verifier/1.0 (+https://discord.com) node-fetch',
-      }
-    });
-    if (!meResp.ok) {
-      const t = await meResp.text().catch(() => '');
-      console.error('[CALLBACK] user fetch failed:', meResp.status, t);
-      return res.status(400).send('Could not fetch user. Try <a href="/login">/login</a> again.');
-    }
+    const meResp = await fetch('https://discord.com/api/users/@me', { headers: { Authorization: `Bearer ${access_token}`, 'User-Agent': 'rp-verifier/1.0 node-fetch' }});
+    if (!meResp.ok) return res.status(400).send('Could not fetch user. Try <a href="/login">/login</a>.');
     const me = await meResp.json();
 
     res.cookie('discordId', me.id, cookieOpts);
     res.cookie('userAccessToken', access_token, cookieOpts);
 
     return res.send(`
-      <html>
-        <head>
-          <link rel="stylesheet" href="/style.css">
-        </head>
-        <body>
-          <div class="container">
-            <img src="https://cdn.discordapp.com/avatars/${me.id}/${me.avatar}.png" 
-                 alt="Avatar" style="width:80px;height:80px;border-radius:50%;margin-bottom:15px;">
-            <h2>Verify your account</h2>
-            <p>Welcome <b>${me.username}</b>! Please enter your email to continue:</p>
-            <form action="/verify" method="POST">
-              <input type="email" name="email" placeholder="Enter your email" required>
-              <button type="submit">Verify</button>
-            </form>
-
-            <p class="note note--important">
-              ⚠️ <b>Use only home Wi-Fi or mobile data. VPNs / public Wi-Fi are not allowed.</b>
-            </p>
-            <p class="note note--important">
-              🚨 <b>Automated, disposable, or fake emails will result in a ban.</b>
-            </p>
-          </div>
-        </body>
-      </html>
+      <html><head><link rel="stylesheet" href="/style.css"></head>
+      <body><div class="container">
+        <img src="https://cdn.discordapp.com/avatars/${me.id}/${me.avatar}.png" alt="Avatar" style="width:80px;height:80px;border-radius:50%;margin-bottom:15px;">
+        <h2>Verify your account</h2>
+        <p>Welcome <b>${me.username}</b>! Please enter your email to continue:</p>
+        <form action="/verify" method="POST">
+          <input type="email" name="email" placeholder="Enter your email" required>
+          <button type="submit">Send Code</button>
+        </form>
+        <p class="note note--important">⚠️ <b>Use only home Wi-Fi or mobile data. VPNs / public Wi-Fi are not allowed.</b></p>
+        <p class="note note--important">🚨 <b>Automated, disposable, or fake emails will result in a ban.</b></p>
+      </div></body></html>
     `);
   } catch (e) {
     console.error('[CALLBACK] error:', e);
@@ -376,7 +319,7 @@ app.get('/callback', async (req, res) => {
 });
 
 /* -----------------------------------------------------------------
-   /verify → auto-join backup + add roles + DM + log + save file
+   STEP 1: /verify → send email code and show code entry form
 ------------------------------------------------------------------ */
 app.post('/verify', async (req, res) => {
   try {
@@ -387,24 +330,117 @@ app.post('/verify', async (req, res) => {
     if (!email) return res.status(400).send('Please provide an email.');
     if (!discordId || !userAccessToken) return res.status(400).send('Session expired. Go to <a href="/login">/login</a>.');
 
-    // ✅ Strong disposable/invalid email check
+    // block disposables / invalid
     if (await isDisposableOrInvalidEmail(email)) {
       return res.status(400).send('❌ Invalid email: disposable, automated, or non-receiving addresses are not allowed.');
     }
 
-    // ✅ VPN / Proxy check
+    // IP policy
     let ip = req.ip;
     const fwd = req.headers['x-forwarded-for'];
     if (fwd && typeof fwd === 'string') ip = fwd.split(',')[0].trim();
-    const blocked = await isVPNorProxy(ip);
-    if (blocked) {
-      return res.status(403).send(
-        "❌ Verification blocked: VPNs, proxies, and public Wi-Fi are not allowed. " +
-        "Please try again from home Wi-Fi or mobile data."
-      );
+    if (await isVPNorProxy(ip)) {
+      return res.status(403).send("❌ Verification blocked: VPNs, proxies, and public Wi-Fi are not allowed. Please try again from home Wi-Fi or mobile data.");
     }
 
-    // A) Auto-join BACKUP server (best-effort)
+    // create/store OTP
+    const code = generateCode();
+    const expiresAt = Date.now() + 10 * 60 * 1000; // 10 minutes
+    const pending = readJson(PENDING_JSON).filter(p => p.discordId !== discordId); // drop older
+    pending.push({ discordId, email, code, expiresAt, attempts: 0 });
+    writeJson(PENDING_JSON, pending);
+
+    // send email
+    try { await sendOtpEmail(email, code); }
+    catch (e) { console.error('[SMTP] send failed:', e?.message || e); return res.status(500).send('Could not send the code email. Please try again later.'); }
+
+    // show code entry form
+    return res.send(`
+      <html><head><link rel="stylesheet" href="/style.css"></head>
+      <body><div class="container">
+        <h2>Enter your code</h2>
+        <p>We sent a <b>6-digit code</b> to <b>${email}</b>. It expires in 10 minutes.</p>
+        <form action="/verify/confirm" method="POST">
+          <input type="text" name="code" placeholder="Enter 6-digit code" minlength="6" maxlength="6" pattern="\\d{6}" required>
+          <button type="submit">Verify & Continue</button>
+        </form>
+        <form action="/verify/resend" method="POST" style="margin-top:10px">
+          <input type="hidden" name="email" value="${email}">
+          <button type="submit">Resend code</button>
+        </form>
+      </div></body></html>
+    `);
+  } catch (e) {
+    console.error('[VERIFY step1] error:', e);
+    return res.status(500).send('❌ Error sending code. Please contact staff.');
+  }
+});
+
+/* -----------------------------------------------------------------
+   STEP 1b: /verify/resend → send a fresh code (same email)
+------------------------------------------------------------------ */
+app.post('/verify/resend', async (req, res) => {
+  try {
+    const email = (req.body && req.body.email) ? String(req.body.email).trim() : '';
+    const discordId = req.cookies.discordId;
+    if (!email || !discordId) return res.status(400).send('Session expired. Start again: <a href="/login">/login</a>.');
+
+    const code = generateCode();
+    const expiresAt = Date.now() + 10 * 60 * 1000;
+
+    let pending = readJson(PENDING_JSON).filter(p => p.discordId !== discordId);
+    pending.push({ discordId, email, code, expiresAt, attempts: 0 });
+    writeJson(PENDING_JSON, pending);
+
+    try { await sendOtpEmail(email, code); }
+    catch (e) { console.error('[SMTP] resend failed:', e?.message || e); return res.status(500).send('Could not resend code right now.'); }
+
+    return res.send('✅ New code sent. Please check your inbox (and spam). Go back and submit the code.');
+  } catch (e) {
+    console.error('[VERIFY resend] error:', e);
+    return res.status(500).send('Error.');
+  }
+});
+
+/* -----------------------------------------------------------------
+   STEP 2: /verify/confirm → check code, then do roles/joins/log
+------------------------------------------------------------------ */
+app.post('/verify/confirm', async (req, res) => {
+  try {
+    const code = (req.body && req.body.code) ? String(req.body.code).trim() : '';
+    const discordId = req.cookies.discordId;
+    const userAccessToken = req.cookies.userAccessToken;
+
+    if (!code || !/^\d{6}$/.test(code)) return res.status(400).send('Enter a valid 6-digit code.');
+    if (!discordId || !userAccessToken) return res.status(400).send('Session expired. Go to <a href="/login">/login</a>.');
+
+    // load pending
+    const pending = readJson(PENDING_JSON);
+    const idx = pending.findIndex(p => p.discordId === discordId);
+    if (idx === -1) return res.status(400).send('No pending code. Start again at <a href="/login">/login</a>.');
+
+    const rec = pending[idx];
+    if (Date.now() > rec.expiresAt) {
+      pending.splice(idx, 1); writeJson(PENDING_JSON, pending);
+      return res.status(400).send('⏱️ Code expired. Please go back and request a new one.');
+    }
+    if (rec.attempts >= 5) {
+      pending.splice(idx, 1); writeJson(PENDING_JSON, pending);
+      return res.status(403).send('Too many attempts. Start over at <a href="/login">/login</a>.');
+    }
+
+    if (rec.code !== code) {
+      rec.attempts += 1; pending[idx] = rec; writeJson(PENDING_JSON, pending);
+      return res.status(400).send(`Incorrect code. Attempts left: ${5 - rec.attempts}`);
+    }
+
+    // ✅ code correct — consume it
+    pending.splice(idx, 1); writeJson(PENDING_JSON, pending);
+    const email = rec.email;
+
+    // proceed with your existing flow…
+
+    // Join BACKUP server (best-effort)
     let joinedBackup = false;
     if (BACKUP_GUILD_ID) {
       const joinResp = await fetch(`https://discord.com/api/guilds/${BACKUP_GUILD_ID}/members/${discordId}`, {
@@ -412,26 +448,26 @@ app.post('/verify', async (req, res) => {
         headers: {
           'Authorization': `Bot ${BOT_TOKEN}`,
           'Content-Type': 'application/json',
-          'User-Agent': 'rp-verifier/1.0 (+https://discord.com) node-fetch',
+          'User-Agent': 'rp-verifier/1.0 node-fetch',
         },
         body: JSON.stringify({ access_token: userAccessToken })
       });
       joinedBackup = joinResp.ok || joinResp.status === 201 || joinResp.status === 204;
     }
 
-    // B) Add Verified role in MAIN server
+    // Give role in MAIN
     const mainGuild = await client.guilds.fetch(MAIN_GUILD_ID);
     const mainMember = await mainGuild.members.fetch(discordId);
     await mainMember.roles.add(VERIFIED_ROLE_ID_MAIN);
 
-    // C) Optional: add Verified role in BACKUP server
+    // Optional role in BACKUP
     if (joinedBackup && VERIFIED_ROLE_ID_BACKUP) {
       const backupGuild = await client.guilds.fetch(BACKUP_GUILD_ID);
       const backupMember = await backupGuild.members.fetch(discordId).catch(() => null);
       if (backupMember) await backupMember.roles.add(VERIFIED_ROLE_ID_BACKUP);
     }
 
-    // D) DM backup invite link
+    // DM backup invite
     if (BACKUP_INVITE_URL) {
       try {
         const user = await client.users.fetch(discordId);
@@ -439,26 +475,22 @@ app.post('/verify', async (req, res) => {
           `✅ You are verified in **${mainGuild.name}**!\n\n` +
           `If the main server is ever unavailable or you leave the backup, here’s your permanent backup invite:\n${BACKUP_INVITE_URL}`
         );
-      } catch (e) {
-        console.warn('[VERIFY] Could not DM user.');
-      }
+      } catch { /* ignore DM errors */ }
     }
 
-    // E) Log verification to staff channel  🔔 (new helper)
+    // Staff log + save
     await sendVerificationLog({ discordId, email });
-
-    // F) Save to verified.json
     try {
       const userObj = await client.users.fetch(discordId).catch(() => null);
       const username = userObj ? `${userObj.username}#${userObj.discriminator ?? '0'}` : discordId;
       saveVerified({ discordId, username, email });
     } catch (e) {
-      console.error('[VERIFY] failed to save verified record:', e);
+      console.error('[VERIFY save] error:', e);
     }
 
-    return res.send(`✅ Verified! Email <b>${email}</b> recorded. You now have access to the server.`);
+    return res.send(`✅ Verified! Email <b>${email}</b> confirmed. You now have access to the server.`);
   } catch (e) {
-    console.error('[VERIFY] error:', e);
+    console.error('[VERIFY step2] error:', e);
     return res.status(500).send('❌ Error verifying. Please contact staff.');
   }
 });
@@ -469,7 +501,7 @@ app.post('/verify', async (req, res) => {
 app.get('/admin/verified.csv', requireAuth, (req, res) => {
   try {
     ensureStore();
-    const rows = JSON.parse(fs.readFileSync(VERIFIED_JSON, 'utf8'));
+    const rows = readJson(VERIFIED_JSON);
     const header = 'discordId,username,email,verifiedAt';
     const csv = [
       header,
@@ -500,7 +532,7 @@ app.get('/_testlog', requireAuth, async (req, res) => {
 /* ----------------------------
    Start server
 ----------------------------- */
-const PORT = process.env.PORT || 3000;   // ✅ deployment-ready port
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🌍 Server running on http://localhost:${PORT}`);
   console.log(`🔑 Start here:   http://localhost:${PORT}/login`);
