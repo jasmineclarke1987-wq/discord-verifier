@@ -1,60 +1,177 @@
-body {
-  background: #2c2f33;
-  font-family: 'Segoe UI', sans-serif;
-  color: white;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  height: 100vh;
-  margin: 0;
+/* Global */
+:root{
+  --brand-primary:#7c3aed;
+  --brand-accent:#b794f4;
+  --brand-bg:#0b0b10;
 }
 
-.container {
-  background: #23272a;
-  padding: 30px;
-  border-radius: 12px;
-  box-shadow: 0 4px 12px rgba(0,0,0,0.5);
-  text-align: center;
-  width: 400px;
+*{ box-sizing:border-box; }
+
+html, body{
+  height:100%;
 }
 
-h2 {
-  color: #7289da;
+body{
+  margin:0;
+  font-family: 'Segoe UI', system-ui, -apple-system, Roboto, Arial, sans-serif;
+  color: #e8e8ee;
+  background:
+    radial-gradient(1200px 600px at 50% -200px, rgba(124,58,237,.25), transparent 60%),
+    linear-gradient(180deg, var(--brand-bg), #141421 60%, #0a0a12);
+  display:flex;
+  align-items:center;
+  justify-content:center;
+  padding:24px;
 }
 
-input[type="email"] {
-  width: 100%;
-  padding: 12px;
-  margin: 15px 0;
-  border-radius: 6px;
-  border: none;
-  outline: none;
+/* Wrapper keeps card centered even on tall screens */
+.wrap{
+  width:100%;
+  max-width: 440px;
+}
+
+/* Card */
+.card{
+  background: rgba(24,24,36,.95);
+  border: 1px solid rgba(255,255,255,.06);
+  border-radius: 16px;
+  box-shadow: 0 10px 40px rgba(0,0,0,.55), inset 0 1px 0 rgba(255,255,255,.03);
+  padding: 28px 26px 24px;
+  text-align:center;
+}
+
+.card .logo{
+  width:84px;
+  height:84px;
+  border-radius:50%;
+  object-fit:cover;
+  margin: 4px auto 10px;
+  border: 2px solid rgba(255,255,255,.08);
+  box-shadow: 0 2px 16px rgba(124,58,237,.35);
+}
+
+.title{
+  margin: 8px 0 4px;
+  font-size: 22px;
+  font-weight: 800;
+  letter-spacing: .2px;
+  color: #f7f7fb;
+}
+
+.subtitle{
+  margin: 0 0 16px;
+  color: #b9bbbe;
   font-size: 14px;
 }
 
-button {
-  background: #5865f2;
-  color: white;
-  border: none;
-  padding: 12px 20px;
-  border-radius: 6px;
-  cursor: pointer;
-  font-size: 15px;
+/* Forms */
+.form{
+  display:flex;
+  flex-direction:column;
+  gap:10px;
+  margin-top: 8px;
 }
 
-button:hover {
-  background: #4752c4;
+.form--inline{
+  margin-top: 8px;
 }
 
-.note {
-  margin-top: 15px;
+input[type="email"], input[type="text"]{
+  width:100%;
+  padding: 12px 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(255,255,255,.12);
+  background:#171726;
+  color:#fff;
+  font-size:14px;
+  outline: none;
+}
+input::placeholder{ color:#8d90a3; }
+
+/* Buttons */
+.btn{
+  display:inline-flex;
+  align-items:center;
+  justify-content:center;
+  gap:8px;
+  border:none;
+  border-radius: 10px;
+  padding: 12px 16px;
+  cursor:pointer;
+  font-weight:700;
+  letter-spacing:.2px;
+  transition: transform .02s ease, box-shadow .2s ease, background .2s ease;
+}
+
+.btn-primary{
+  background: linear-gradient(180deg, var(--brand-primary), #5b2bd6);
+  color:#fff;
+  box-shadow: 0 6px 18px rgba(124,58,237,.45);
+}
+.btn-primary:hover{
+  transform: translateY(-1px);
+  box-shadow: 0 10px 24px rgba(124,58,237,.52);
+}
+.btn-ghost{
+  background:transparent;
+  color:#c6c7d3;
+  border:1px solid rgba(255,255,255,.12);
+}
+.btn-ghost:hover{
+  background:rgba(255,255,255,.03);
+}
+.btn-wide{ width:100%; margin-top: 10px; }
+
+/* Rules / Notes */
+.rules{
+  margin-top: 14px;
+  text-align: left;
+  color:#ffb3b3;
+  font-weight: 700;
+  font-size: 12.5px;
+  line-height:1.5;
+}
+
+/* Success banner */
+.success-banner{
+  display:flex;
+  gap:12px;
+  align-items:center;
+  background: rgba(46, 211, 107, .08);
+  border: 1px solid rgba(46, 211, 107, .25);
+  color: #b8f6ce;
+  padding: 12px;
+  border-radius: 12px;
+  margin: 10px 0 14px;
+  text-align:left;
+}
+.success-banner .check{
+  width:28px;height:28px;line-height:28px;
+  display:inline-flex;align-items:center;justify-content:center;
+  background:#2ed36b;
+  color:#08140d;
+  border-radius:50%;
+  font-weight:900;
+}
+.success-title{ font-weight:800; color:#d9ffe9; }
+.success-sub{ color:#a7e8c6; font-size:13px; }
+
+/* Small hint text */
+.hint{
+  margin: 10px 0 0;
+  color:#9fa3b7;
+  font-size:12px;
+  text-align:center;
+}
+
+/* (Legacy) notes class kept for compatibility */
+.note{
+  margin-top: 12px;
   font-size: 13px;
   color: #b9bbbe;
 }
-
-/* very important notices */
-.note--important {
-  font-weight: 700;
-  color: #ff5252;          /* high-visibility red */
+.note--important{
+  font-weight: 800;
+  color: #ff5252;
   display: block;
 }

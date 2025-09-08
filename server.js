@@ -29,7 +29,7 @@ app.use(express.static('public'));
 
 // ✅ Rate-limits
 app.use('/verify', rateLimit({ windowMs: 2 * 60 * 1000, max: 20 }));          // email submit
-app.use('/verify/confirm', rateLimit({ windowMs: 2 * 60 * 1000, max: 20 }));  // code submit
+app.use('/verify/confirm', rateLimit({ windowMs: 2 * 60 * 1000, max: 20 }));  // code submit (GET/POST)
 app.use('/verify/resend', rateLimit({ windowMs: 5 * 60 * 1000, max: 5 }));    // resend
 
 const {
@@ -38,8 +38,24 @@ const {
   VERIFIED_ROLE_ID_MAIN, VERIFIED_ROLE_ID_BACKUP,
   LOG_CHANNEL_ID, BACKUP_INVITE_URL,
   ADMIN_USER, ADMIN_PASS,
-  SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM
+  SMTP_HOST, SMTP_PORT, SMTP_USER, SMTP_PASS, SMTP_FROM,
+
+  // 🔧 Optional branding variables (safe defaults below)
+  BRAND_NAME,
+  BRAND_LOGO,
+  BRAND_PRIMARY,
+  BRAND_ACCENT,
+  BRAND_BG
 } = process.env;
+
+// 🔧 Branding defaults (can override via .env)
+const BRAND = {
+  name: BRAND_NAME || 'ReturnPoint',
+  logo: BRAND_LOGO || 'https://cdn.discordapp.com/attachments/111111111111111111/111111111111111111/rp-logo.png',
+  primary: BRAND_PRIMARY || '#7c3aed', // purple
+  accent: BRAND_ACCENT || '#b794f4',
+  bg: BRAND_BG || '#0b0b10',
+};
 
 // ✅ Data storage setup (supports Render disk via DATA_DIR)
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
@@ -230,7 +246,6 @@ function makeTransport() {
 const mailer = makeTransport();
 
 function generateCode() {
-  // 6-digit numeric, zero-padded
   return (Math.floor(Math.random() * 1_000_000)).toString().padStart(6, '0');
 }
 async function sendOtpEmail(to, code) {
@@ -242,6 +257,30 @@ async function sendOtpEmail(to, code) {
     </div>`;
   const text = `Your verification code is: ${code}\nIt expires in 10 minutes.`;
   await mailer.sendMail({ from: SMTP_FROM, to, subject: 'Your verification code', text, html });
+}
+
+/* -----------------------------------
+   Small helpers for HTML (no nested backticks!)
+----------------------------------- */
+function brandVars() {
+  return (
+    '<style>' +
+    ':root{' +
+      `--brand-primary:${BRAND.primary};` +
+      `--brand-accent:${BRAND.accent};` +
+      `--brand-bg:${BRAND.bg};` +
+    '}' +
+    '</style>'
+  );
+}
+function headerCard(title = 'Verify your account', subtitle = '') {
+  const logoImg = BRAND.logo ? `<img class="logo" src="${BRAND.logo}" alt="${BRAND.name} logo">` : '';
+  return (
+    '<div class="card">' +
+      logoImg +
+      `<h1 class="title">${title}</h1>` +
+      (subtitle ? `<p class="subtitle">${subtitle}</p>` : '')
+  ); // NOTE: this opens <div class="card">; the page templates close it.
 }
 
 /* -----------------------------------
@@ -298,20 +337,30 @@ app.get('/callback', async (req, res) => {
     res.cookie('discordId', me.id, cookieOpts);
     res.cookie('userAccessToken', access_token, cookieOpts);
 
-    return res.send(`
-      <html><head><link rel="stylesheet" href="/style.css"></head>
-      <body><div class="container">
-        <img src="https://cdn.discordapp.com/avatars/${me.id}/${me.avatar}.png" alt="Avatar" style="width:80px;height:80px;border-radius:50%;margin-bottom:15px;">
-        <h2>Verify your account</h2>
-        <p>Welcome <b>${me.username}</b>! Please enter your email to continue:</p>
-        <form action="/verify" method="POST">
-          <input type="email" name="email" placeholder="Enter your email" required>
-          <button type="submit">Send Code</button>
-        </form>
-        <p class="note note--important">⚠️ <b>Use only home Wi-Fi or mobile data. VPNs / public Wi-Fi are not allowed.</b></p>
-        <p class="note note--important">🚨 <b>Automated, disposable, or fake emails will result in a ban.</b></p>
-      </div></body></html>
-    `);
+    const subtitle = 'Welcome <b>' + me.username + '</b>! Enter your email to continue.';
+
+    return res.send(
+      '<html>' +
+        '<head>' +
+          '<link rel="stylesheet" href="/style.css">' +
+          brandVars() +
+        '</head>' +
+        '<body>' +
+          '<div class="wrap">' +
+            headerCard('Verify your account', subtitle) +
+              '<form action="/verify" method="POST" class="form">' +
+                '<input type="email" name="email" placeholder="you@email.com" required>' +
+                '<button class="btn btn-primary" type="submit">Send Code</button>' +
+              '</form>' +
+              '<div class="rules">' +
+                '<p><b>⚠️ VPNs / public Wi-Fi are not allowed.</b></p>' +
+                '<p><b>🚨 Disposable or fake emails will result in a ban.</b></p>' +
+              '</div>' +
+            '</div>' +
+          '</div>' +
+        '</body>' +
+      '</html>'
+    );
   } catch (e) {
     console.error('[CALLBACK] error:', e);
     return res.status(500).send('Internal error in /callback. Please try again.');
@@ -340,7 +389,7 @@ app.post('/verify', async (req, res) => {
     const fwd = req.headers['x-forwarded-for'];
     if (fwd && typeof fwd === 'string') ip = fwd.split(',')[0].trim();
     if (await isVPNorProxy(ip)) {
-      return res.status(403).send("❌ Verification blocked: VPNs, proxies, and public Wi-Fi are not allowed. Please try again from home Wi-Fi or mobile data.");
+      return res.status(403).send('❌ Verification blocked: VPNs, proxies, and public Wi-Fi are not allowed. Please try again from home Wi-Fi or mobile data.');
     }
 
     // create/store OTP
@@ -355,21 +404,28 @@ app.post('/verify', async (req, res) => {
     catch (e) { console.error('[SMTP] send failed:', e?.message || e); return res.status(500).send('Could not send the code email. Please try again later.'); }
 
     // show code entry form
-    return res.send(`
-      <html><head><link rel="stylesheet" href="/style.css"></head>
-      <body><div class="container">
-        <h2>Enter your code</h2>
-        <p>We sent a <b>6-digit code</b> to <b>${email}</b>. It expires in 10 minutes.</p>
-        <form action="/verify/confirm" method="POST">
-          <input type="text" name="code" placeholder="Enter 6-digit code" minlength="6" maxlength="6" pattern="\\d{6}" required>
-          <button type="submit">Verify & Continue</button>
-        </form>
-        <form action="/verify/resend" method="POST" style="margin-top:10px">
-          <input type="hidden" name="email" value="${email}">
-          <button type="submit">Resend code</button>
-        </form>
-      </div></body></html>
-    `);
+    return res.send(
+      '<html>' +
+        '<head>' +
+          '<link rel="stylesheet" href="/style.css">' +
+          brandVars() +
+        '</head>' +
+        '<body>' +
+          '<div class="wrap">' +
+            headerCard('Enter your code', 'We sent a <b>6-digit code</b> to <b>' + email + '</b>. It expires in 10 minutes.') +
+              '<form action="/verify/confirm" method="POST" class="form">' +
+                '<input type="text" name="code" placeholder="6-digit code" minlength="6" maxlength="6" pattern="\\d{6}" required>' +
+                '<button class="btn btn-primary" type="submit">Verify</button>' +
+              '</form>' +
+              '<form action="/verify/resend" method="POST" class="form form--inline">' +
+                `<input type="hidden" name="email" value="${email}">` +
+                '<button class="btn btn-ghost" type="submit">Resend code</button>' +
+              '</form>' +
+            '</div>' +
+          '</div>' +
+        '</body>' +
+      '</html>'
+    );
   } catch (e) {
     console.error('[VERIFY step1] error:', e);
     return res.status(500).send('❌ Error sending code. Please contact staff.');
@@ -403,7 +459,7 @@ app.post('/verify/resend', async (req, res) => {
 });
 
 /* -----------------------------------------------------------------
-   STEP 2: /verify/confirm → check code, then do roles/joins/log
+   STEP 2: /verify/confirm (POST) → check code, then roles/joins/log
 ------------------------------------------------------------------ */
 app.post('/verify/confirm', async (req, res) => {
   try {
@@ -437,8 +493,6 @@ app.post('/verify/confirm', async (req, res) => {
     // ✅ code correct — consume it
     pending.splice(idx, 1); writeJson(PENDING_JSON, pending);
     const email = rec.email;
-
-    // proceed with your existing flow…
 
     // Join BACKUP server (best-effort)
     let joinedBackup = false;
@@ -488,11 +542,48 @@ app.post('/verify/confirm', async (req, res) => {
       console.error('[VERIFY save] error:', e);
     }
 
-    return res.send(`✅ Verified! Email <b>${email}</b> confirmed. You now have access to the server.`);
+    // ✅ Redirect to the pretty success page
+    return res.redirect(`/verify/confirm?email=${encodeURIComponent(email)}`);
   } catch (e) {
     console.error('[VERIFY step2] error:', e);
     return res.status(500).send('❌ Error verifying. Please contact staff.');
   }
+});
+
+/* -----------------------------------------------------------------
+   STEP 2: /verify/confirm (GET) → pretty success screen
+------------------------------------------------------------------ */
+app.get('/verify/confirm', (req, res) => {
+  const email = (req.query.email || '').toString();
+  const serverLink = MAIN_GUILD_ID
+    ? `https://discord.com/channels/${MAIN_GUILD_ID}`
+    : 'https://discord.com/channels/@me';
+
+  const subtitle = 'You have successfully verified in <b>' + BRAND.name + '</b>.';
+
+  return res.send(
+    '<html>' +
+      '<head>' +
+        '<link rel="stylesheet" href="/style.css">' +
+        brandVars() +
+      '</head>' +
+      '<body>' +
+        '<div class="wrap">' +
+          headerCard('Success!', subtitle) +
+            '<div class="success-banner">' +
+              '<span class="check">✔</span>' +
+              '<div>' +
+                '<div class="success-title">Verification complete</div>' +
+                '<div class="success-sub">Email ' + (email ? ('<b>' + email + '</b>') : '') + ' confirmed.</div>' +
+              '</div>' +
+            '</div>' +
+            `<a class="btn btn-primary btn-wide" href="${serverLink}">Open Discord</a>` +
+            '<p class="hint">If the button doesn’t open the server, switch back to Discord — your access is unlocked.</p>' +
+          '</div>' +
+        '</div>' +
+      '</body>' +
+    '</html>'
+  );
 });
 
 /* -----------------------------------------------------------------
