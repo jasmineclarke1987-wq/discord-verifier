@@ -51,8 +51,8 @@ const {
 // 🔧 Branding defaults (can override via .env)
 const BRAND = {
   name: BRAND_NAME || 'ReturnPoint',
-  logo: BRAND_LOGO || 'https://cdn.discordapp.com/attachments/111111111111111111/111111111111111111/rp-logo.png',
-  primary: BRAND_PRIMARY || '#7c3aed', // purple
+  logo: (BRAND_LOGO || '').trim(),           // may be empty/temporary; we’ll resolve below per request
+  primary: BRAND_PRIMARY || '#7c3aed',        // purple
   accent: BRAND_ACCENT || '#b794f4',
   bg: BRAND_BG || '#0b0b10',
 };
@@ -193,6 +193,34 @@ async function exchangeCodeForToken({ code, clientId, clientSecret, redirectUri,
 }
 
 /* -----------------------------------
+   LOGO RESOLUTION (Guild icon > BRAND_LOGO > /public/logo.png)
+----------------------------------- */
+function buildGuildIconURL(g) {
+  if (!g || !g.id || !g.icon) return '';
+  const ext = g.icon.startsWith('a_') ? 'gif' : 'png';
+  return `https://cdn.discordapp.com/icons/${g.id}/${g.icon}.${ext}?size=256`;
+}
+
+async function resolveBrandLogo() {
+  // 1) Prefer guild icon (most reliable + branded)
+  try {
+    if (MAIN_GUILD_ID) {
+      const guild = await client.guilds.fetch(MAIN_GUILD_ID);
+      const icon = buildGuildIconURL(guild);
+      if (icon) return icon;
+    }
+  } catch (e) {
+    console.warn('[BRAND] Could not fetch guild icon:', e?.message || e);
+  }
+
+  // 2) Use BRAND_LOGO if it looks like a permanent CDN link (no expiring query)
+  if (BRAND.logo && !/(\?|&)ex=/.test(BRAND.logo)) return BRAND.logo;
+
+  // 3) Fallback to local file in /public (logo.png)
+  return '/logo.png';
+}
+
+/* -----------------------------------
    LOGGING HELPERS
 ----------------------------------- */
 async function getLogChannel() {
@@ -249,13 +277,14 @@ function generateCode() {
   return (Math.floor(Math.random() * 1_000_000)).toString().padStart(6, '0');
 }
 async function sendOtpEmail(to, code) {
-  const html = `
-    <div style="font-family:Segoe UI,Arial,sans-serif;font-size:16px">
-      <p>Here is your verification code:</p>
-      <p style="font-size:24px;font-weight:700;letter-spacing:3px">${code}</p>
-      <p>This code expires in <b>10 minutes</b>. If you didn’t request it, you can ignore this email.</p>
-    </div>`;
-  const text = `Your verification code is: ${code}\nIt expires in 10 minutes.`;
+  const html = (
+    '<div style="font-family:Segoe UI,Arial,sans-serif;font-size:16px">' +
+      '<p>Here is your verification code:</p>' +
+      '<p style="font-size:24px;font-weight:700;letter-spacing:3px">' + code + '</p>' +
+      '<p>This code expires in <b>10 minutes</b>. If you didn’t request it, you can ignore this email.</p>' +
+    '</div>'
+  );
+  const text = 'Your verification code is: ' + code + '\nIt expires in 10 minutes.';
   await mailer.sendMail({ from: SMTP_FROM, to, subject: 'Your verification code', text, html });
 }
 
@@ -273,14 +302,14 @@ function brandVars() {
     '</style>'
   );
 }
-function headerCard(title = 'Verify your account', subtitle = '') {
-  const logoImg = BRAND.logo ? `<img class="logo" src="${BRAND.logo}" alt="${BRAND.name} logo">` : '';
+function headerCard(title = 'Verify your account', subtitle = '', logoUrl = '') {
+  const logoImg = logoUrl ? `<img class="logo" src="${logoUrl}" alt="${BRAND.name} logo">` : '';
   return (
     '<div class="card">' +
       logoImg +
       `<h1 class="title">${title}</h1>` +
       (subtitle ? `<p class="subtitle">${subtitle}</p>` : '')
-  ); // NOTE: this opens <div class="card">; the page templates close it.
+  ); // NOTE: card is opened here; page templates close it.
 }
 
 /* -----------------------------------
@@ -338,6 +367,7 @@ app.get('/callback', async (req, res) => {
     res.cookie('userAccessToken', access_token, cookieOpts);
 
     const subtitle = 'Welcome <b>' + me.username + '</b>! Enter your email to continue.';
+    const logoUrl = await resolveBrandLogo();
 
     return res.send(
       '<html>' +
@@ -347,7 +377,7 @@ app.get('/callback', async (req, res) => {
         '</head>' +
         '<body>' +
           '<div class="wrap">' +
-            headerCard('Verify your account', subtitle) +
+            headerCard('Verify your account', subtitle, logoUrl) +
               '<form action="/verify" method="POST" class="form">' +
                 '<input type="email" name="email" placeholder="you@email.com" required>' +
                 '<button class="btn btn-primary" type="submit">Send Code</button>' +
@@ -403,6 +433,8 @@ app.post('/verify', async (req, res) => {
     try { await sendOtpEmail(email, code); }
     catch (e) { console.error('[SMTP] send failed:', e?.message || e); return res.status(500).send('Could not send the code email. Please try again later.'); }
 
+    const logoUrl = await resolveBrandLogo();
+
     // show code entry form
     return res.send(
       '<html>' +
@@ -412,7 +444,7 @@ app.post('/verify', async (req, res) => {
         '</head>' +
         '<body>' +
           '<div class="wrap">' +
-            headerCard('Enter your code', 'We sent a <b>6-digit code</b> to <b>' + email + '</b>. It expires in 10 minutes.') +
+            headerCard('Enter your code', 'We sent a <b>6-digit code</b> to <b>' + email + '</b>. It expires in 10 minutes.', logoUrl) +
               '<form action="/verify/confirm" method="POST" class="form">' +
                 '<input type="text" name="code" placeholder="6-digit code" minlength="6" maxlength="6" pattern="\\d{6}" required>' +
                 '<button class="btn btn-primary" type="submit">Verify</button>' +
@@ -553,13 +585,14 @@ app.post('/verify/confirm', async (req, res) => {
 /* -----------------------------------------------------------------
    STEP 2: /verify/confirm (GET) → pretty success screen
 ------------------------------------------------------------------ */
-app.get('/verify/confirm', (req, res) => {
+app.get('/verify/confirm', async (req, res) => {
   const email = (req.query.email || '').toString();
   const serverLink = MAIN_GUILD_ID
     ? `https://discord.com/channels/${MAIN_GUILD_ID}`
     : 'https://discord.com/channels/@me';
 
   const subtitle = 'You have successfully verified in <b>' + BRAND.name + '</b>.';
+  const logoUrl = await resolveBrandLogo();
 
   return res.send(
     '<html>' +
@@ -569,7 +602,7 @@ app.get('/verify/confirm', (req, res) => {
       '</head>' +
       '<body>' +
         '<div class="wrap">' +
-          headerCard('Success!', subtitle) +
+          headerCard('Success!', subtitle, logoUrl) +
             '<div class="success-banner">' +
               '<span class="check">✔</span>' +
               '<div>' +
