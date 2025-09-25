@@ -382,7 +382,7 @@ app.get('/callback', async (req, res) => {
                 '<input type="email" name="email" placeholder="you@email.com" required>' +
                 '<button class="btn btn-primary" type="submit">Send Code</button>' +
               '</form>' +
-              '<div class="rules">' + +
+              '<div class="rules">' +
                 '<p><b>🚨 Disposable or fake emails will result in a ban.</b></p>' +
               '</div>' +
             '</div>' +
