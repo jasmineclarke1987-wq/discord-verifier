@@ -297,3 +297,11 @@ app.post('/verify', async (req, res) => {
     return res.send(`<html><head><link rel="stylesheet" href="/style.css">${brandVars()}</head><body><div class="wrap">${headerCard('Enter your code', 'We sent a <b>6-digit code</b> to <b>' + email + '</b>.', logoUrl)}<form action="/verify/confirm" method="POST" class="form"><input type="text" name="code" placeholder="6-digit code" required><button class="btn btn-primary" type="submit">Verify</button></form></div></body></html>`);
   } catch (e) { console.error('[VERIFY step1] error:', e); return res.status(500).send('Error sending code.'); }
 });
+
+// ----------------------------------------------------
+// Render needs the app to listen on a port:
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
+// ----------------------------------------------------
