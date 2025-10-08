@@ -261,7 +261,6 @@ app.get('/login', (req, res) => {
   res.redirect(url);
 });
 
-// NEW: handle Discord redirect and send user to the email form
 app.get('/callback', async (req, res) => {
   try {
     const { code, state } = req.query;
@@ -289,7 +288,6 @@ app.get('/callback', async (req, res) => {
     res.cookie('discordId', user.id, { ...cookieOpts, maxAge: 60 * 60 * 1000 });
     res.cookie('userAccessToken', tokenData.access_token, { ...cookieOpts, maxAge: 60 * 60 * 1000 });
 
-    // Go to the email form
     res.redirect('/verify');
   } catch (e) {
     console.error('[CALLBACK ERROR]', e?.message || e);
@@ -298,7 +296,7 @@ app.get('/callback', async (req, res) => {
 });
 // ---------- OAuth end ----------
 
-// NEW: email entry form (shown after /callback)
+// Email entry page (+ disposable warning)
 app.get('/verify', async (req, res) => {
   try {
     const logoUrl = await resolveBrandLogo();
@@ -313,6 +311,9 @@ app.get('/verify', async (req, res) => {
             <input type="email" name="email" placeholder="you@email.com" required>
             <button class="btn btn-primary" type="submit">Send code</button>
           </form>
+          <p class="subtitle" style="opacity:.65;margin-top:10px">
+            ⚠ Disposable / temporary emails are <b>not</b> allowed. Please use a real mailbox.
+          </p>
         </div>
       </body></html>`
     );
@@ -322,6 +323,7 @@ app.get('/verify', async (req, res) => {
   }
 });
 
+// Step 1: send code
 app.post('/verify', async (req, res) => {
   try {
     const email = (req.body && req.body.email) ? String(req.body.email).trim() : '';
@@ -335,7 +337,6 @@ app.post('/verify', async (req, res) => {
     let ip = req.ip;
     const fwd = req.headers['x-forwarded-for'];
     if (fwd && typeof fwd === 'string') ip = fwd.split(',')[0].trim();
-
     if (VPN_CHECK_ENABLED) {
       try {
         if (await isVPNorProxy(ip)) {
@@ -373,10 +374,78 @@ app.post('/verify', async (req, res) => {
   } catch (e) { console.error('[VERIFY step1] error:', e); return res.status(500).send('Error sending code.'); }
 });
 
-// ----------------------------------------------------
-// Render needs the app to listen on a port:
-const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+// Step 2: confirm code, join server, add role
+app.post('/verify/confirm', async (req, res) => {
+  try {
+    const discordId = req.cookies.discordId;
+    const accessToken = req.cookies.userAccessToken;
+    const code = (req.body && req.body.code) ? String(req.body.code).trim() : '';
+
+    if (!discordId || !accessToken) return res.status(400).send('Session expired. Please <a href="/login">start again</a>.');
+    if (!code) return res.status(400).send('Code is required.');
+
+    // find pending
+    const pending = readJson(PENDING_JSON);
+    const rec = pending.find(p => p.discordId === discordId);
+    if (!rec) return res.status(400).send('No pending verification. Please restart.');
+    if (Date.now() > rec.expiresAt) {
+      writeJson(PENDING_JSON, pending.filter(p => p.discordId !== discordId));
+      return res.status(400).send('Code expired. Please restart.');
+    }
+    if (rec.code !== code) {
+      rec.attempts = (rec.attempts || 0) + 1;
+      writeJson(PENDING_JSON, pending);
+      return res.status(400).send('Invalid code. Please try again.');
+    }
+
+    // ensure guild membership using guilds.join
+    if (MAIN_GUILD_ID) {
+      await fetch(`https://discord.com/api/guilds/${MAIN_GUILD_ID}/members/${discordId}`, {
+        method: 'PUT',
+        headers: {
+          'Authorization': `Bot ${BOT_TOKEN}`,
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ access_token: accessToken })
+      }).catch(() => {}); // if already a member, this may 204/400, it's fine
+
+      try {
+        const guild = await client.guilds.fetch(MAIN_GUILD_ID);
+        const member = await guild.members.fetch(discordId);
+        if (VERIFIED_ROLE_ID_MAIN && !member.roles.cache.has(VERIFIED_ROLE_ID_MAIN)) {
+          await member.roles.add(VERIFIED_ROLE_ID_MAIN).catch(() => {});
+        }
+      } catch (e) {
+        console.warn('[ROLE] Could not assign role:', e?.message || e);
+      }
+    }
+
+    // log + persist
+    await sendVerificationLog({ discordId, email: rec.email });
+    saveVerified({ discordId, username: discordId, email: rec.email });
+
+    // clear pending
+    writeJson(PENDING_JSON, pending.filter(p => p.discordId !== discordId));
+
+    const logoUrl = await resolveBrandLogo();
+    return res.send(
+      `<html><head>
+        <link rel="stylesheet" href="/style.css">
+        ${brandVars()}
+      </head><body>
+        <div class="wrap">
+          ${headerCard('All set! ✅', 'You are verified and have been added to the server.', logoUrl)}
+          <p class="subtitle">You can close this page.</p>
+        </div>
+      </body></html>`
+    );
+  } catch (e) {
+    console.error('[VERIFY confirm] error:', e?.message || e);
+    res.status(500).send('Verification failed. Please try again.');
+  }
 });
+
+// ----------------------------------------------------
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
 // ----------------------------------------------------
