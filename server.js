@@ -249,6 +249,7 @@ function headerCard(title = 'Verify your account', subtitle = '', logoUrl = '') 
 
 app.get('/health', (_req, res) => res.status(200).send('ok'));
 
+// ---------- OAuth start ----------
 app.get('/login', (req, res) => {
   const state = crypto.randomBytes(16).toString('hex');
   res.cookie('oauth_state', state, { ...cookieOpts, maxAge: 10 * 60 * 1000 });
@@ -258,6 +259,67 @@ app.get('/login', (req, res) => {
     + `&response_type=code&scope=${encodeURIComponent('identify guilds.join')}`
     + `&state=${state}&prompt=consent`;
   res.redirect(url);
+});
+
+// NEW: handle Discord redirect and send user to the email form
+app.get('/callback', async (req, res) => {
+  try {
+    const { code, state } = req.query;
+    const storedState = req.cookies.oauth_state;
+    if (!state || !storedState || state !== storedState) {
+      return res.status(400).send('Invalid state. Please restart at /login');
+    }
+
+    const tokenData = await exchangeCodeForToken({
+      code,
+      clientId: CLIENT_ID,
+      clientSecret: CLIENT_SECRET,
+      redirectUri: REDIRECT_URI,
+      fetchImpl: fetch
+    });
+    if (!tokenData || !tokenData.access_token) {
+      return res.status(400).send('Failed to obtain access token.');
+    }
+
+    const uResp = await fetch('https://discord.com/api/users/@me', {
+      headers: { Authorization: `Bearer ${tokenData.access_token}` }
+    });
+    const user = await uResp.json();
+
+    res.cookie('discordId', user.id, { ...cookieOpts, maxAge: 60 * 60 * 1000 });
+    res.cookie('userAccessToken', tokenData.access_token, { ...cookieOpts, maxAge: 60 * 60 * 1000 });
+
+    // Go to the email form
+    res.redirect('/verify');
+  } catch (e) {
+    console.error('[CALLBACK ERROR]', e?.message || e);
+    res.status(500).send('Callback failed.');
+  }
+});
+// ---------- OAuth end ----------
+
+// NEW: email entry form (shown after /callback)
+app.get('/verify', async (req, res) => {
+  try {
+    const logoUrl = await resolveBrandLogo();
+    return res.send(
+      `<html><head>
+        <link rel="stylesheet" href="/style.css">
+        ${brandVars()}
+      </head><body>
+        <div class="wrap">
+          ${headerCard('Verify your email', 'Enter your email to receive a 6-digit code.', logoUrl)}
+          <form action="/verify" method="POST" class="form">
+            <input type="email" name="email" placeholder="you@email.com" required>
+            <button class="btn btn-primary" type="submit">Send code</button>
+          </form>
+        </div>
+      </body></html>`
+    );
+  } catch (e) {
+    console.error('[VERIFY GET] error:', e);
+    res.status(500).send('Error loading form.');
+  }
 });
 
 app.post('/verify', async (req, res) => {
@@ -294,7 +356,20 @@ app.post('/verify', async (req, res) => {
     catch (e) { console.error('[SMTP] send failed:', e?.message || e); return res.status(500).send('Could not send email.'); }
 
     const logoUrl = await resolveBrandLogo();
-    return res.send(`<html><head><link rel="stylesheet" href="/style.css">${brandVars()}</head><body><div class="wrap">${headerCard('Enter your code', 'We sent a <b>6-digit code</b> to <b>' + email + '</b>.', logoUrl)}<form action="/verify/confirm" method="POST" class="form"><input type="text" name="code" placeholder="6-digit code" required><button class="btn btn-primary" type="submit">Verify</button></form></div></body></html>`);
+    return res.send(
+      `<html><head>
+        <link rel="stylesheet" href="/style.css">
+        ${brandVars()}
+      </head><body>
+        <div class="wrap">
+          ${headerCard('Enter your code', 'We sent a <b>6-digit code</b> to <b>' + email + '</b>.', logoUrl)}
+          <form action="/verify/confirm" method="POST" class="form">
+            <input type="text" name="code" placeholder="6-digit code" required>
+            <button class="btn btn-primary" type="submit">Verify</button>
+          </form>
+        </div>
+      </body></html>`
+    );
   } catch (e) { console.error('[VERIFY step1] error:', e); return res.status(500).send('Error sending code.'); }
 });
 
